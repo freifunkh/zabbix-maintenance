@@ -1,42 +1,53 @@
 #!/usr/bin/env python3
 
-# import argparse
+import argparse
+import configparser
 import datetime
 import json
 import os.path
 import urllib.parse
 import urllib.request
-# import sys
+import socket
+import sys
+
+
+class ZabbixCliConfig:
+    def __init__(self):
+        zabbix_config = "~/.zabbix-cli/zabbix-cli.conf"
+        zabbix_auth = "~/.zabbix-cli_auth_token"
+
+        # find URL
+        try:
+            config = configparser.ConfigParser()
+            config.read(os.path.expanduser(zabbix_config))
+            self.url = config["zabbix_api"]["zabbix_api_url"]
+        except KeyError:
+            self.url = None
+
+        # find auth token
+        try:
+            with open(os.path.expanduser(zabbix_auth), "r") as f:
+                content = f.read()
+                if len(content) == 37 and content.startswith("cli::"):
+                    self.auth = content[5:]
+        except FileNotFoundError:
+            self.auth = None
 
 
 class ZabbixSession:
-    def __init__(self, url, user=None, password=None):
-        self.url = url
-        self.user = user
-        self.password = password
-        self.auth = None
-        self._request_id = 0
-
-        if user:
-            # login by username and password
-            data = {
-                "method": "user.login",
-                "params": {
-                    "user": self.user,
-                    "password": self.password
-                }
-            }
-            response = self._request(data)
-            self.auth = response["result"]
+    def __init__(self, url, user=None, password=None, auth=None):
+        if auth:
+            self.user = None
+            self.password = None
+            self.auth = auth
         else:
-            # try to read auth token from file
-            with open(os.path.expanduser("~/.zabbix-cli_auth_token"), "r") as f:
-                content = f.read().decode()
-                if len(content) == 37 and content.startswith("cli::"):
-                    self.auth = content[5:]
+            self.user = user
+            self.password = password
+            self.auth = None
 
-        if not self.auth:
-            raise ValueError("No credentials given and no valid token file found.")
+        self.logged_in = False
+        self.url = url
+        self._request_id = 0
 
     def _request(self, data):
         data["jsonrpc"] = "2.0"
@@ -53,8 +64,20 @@ class ZabbixSession:
         self._request_id += 1
         return self._request_id
 
+    def login(self):
+        # login by username and password
+        data = {
+            "method": "user.login",
+            "params": {
+                "user": self.user,
+                "password": self.password
+            }
+        }
+        response = self._request(data)
+        self.auth = response["result"]
+        self.logged_in = True
+
     def logout(self):
-        # print("logout")
         data = {
             "method": "user.logout",
             "params": []
@@ -62,10 +85,12 @@ class ZabbixSession:
         self._request(data)
 
     def __enter__(self):
+        if not self.auth:
+            self.login()
         return self
 
     def __exit__(self, type, value, traceback):
-        if self.user:
+        if self.logged_in:
             # logged in by username and password
             self.logout()
 
@@ -83,13 +108,16 @@ class ZabbixSession:
         response = self._request(data)
         try:
             return response["result"][0]["hostid"]
+        except IndexError:
+            return None
         except KeyError:
             return None
 
     def maintenance_create(self, host_name, duration_minutes):
-        # print("maintenance_create")
         duration_seconds = duration_minutes * 60
         host_id = self.get_host_id(host_name)
+        if not host_id:
+            raise ValueError("Unknown host: " + str(host_name))
         dt = datetime.datetime.now()
         time_start = int(dt.timestamp())
         time_stop = time_start + duration_seconds
@@ -111,10 +139,12 @@ class ZabbixSession:
                 "tags": []
             }
         }
-        self._request(data)
+        result = self._request(data)
+        if "error" in result:
+            raise ValueError("API error:\n{} {}".format(result["error"].get("message", ""),
+                                                        result["error"].get("data", "")))
 
     def maintenance_delete_expired(self):
-        # print("maintenance_delete_expired")
         now = int(datetime.datetime.now().timestamp())
         data = {
             "method": "maintenance.get",
@@ -136,23 +166,43 @@ class ZabbixSession:
 
 
 if __name__ == "__main__":
-    # TODO: Proper interface
-    # parser = argparse.ArgumentParser(description="")
-    # parser.add_argument("url")
-    # parser.add_argument("username")
-    # parser.add_argument("password")
-    # args = parser.parse_args()
+    parser = argparse.ArgumentParser(description="Sets the host into Zabbix maintenance mode. \
+Config of zabbix-cli is used if user, password or URL are undefined.")
+    parser.add_argument("--url", help="Zabbix API URL")
+    parser.add_argument("--user", help="API user name")
+    parser.add_argument("--password", help="API password")
+    parser.add_argument("minutes", type=int, help="Length of the maintenance window")
+    args = parser.parse_args()
 
-    # if args.username and not args.password:
-    #     print("Password missing.", file=sys.stderr)
-    #     sys.exit(1)
+    config = ZabbixCliConfig()
 
-    api_url = ""
-    username = ""
-    password = ""
-    minutes = 30
-    host = ""
+    if args.url:
+        api_url = args.url
+    elif config.url:
+        api_url = config.url
+    else:
+        print("URL undefined.", file=sys.stderr)
+        sys.exit(1)
 
-    with ZabbixSession(api_url, username, password) as zabbix:
-        zabbix.maintenance_create(host, minutes)
-        zabbix.maintenance_delete_expired()
+    if args.user:
+        user = args.user
+        password = args.password
+        auth = None
+    elif config.auth:
+        user = None
+        password = None
+        auth = config.auth
+    else:
+        user = None
+        password = None
+        auth = None
+
+    host = socket.gethostname()
+
+    with ZabbixSession(url=api_url, user=user, password=password, auth=auth) as zabbix:
+        try:
+            zabbix.maintenance_create(host, args.minutes)
+            zabbix.maintenance_delete_expired()
+        except ValueError as e:
+            print(e, file=sys.stderr)
+            sys.exit(2)
